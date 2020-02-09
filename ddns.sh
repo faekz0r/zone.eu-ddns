@@ -5,18 +5,20 @@
 # Software used: dig, curl, jq.
 #
 # You can use curl -X GET "https://api.zone.eu/v2/dns/example.com/a" -H "accept: application/json" -H "authorization: Basic example.credentials.hash"
-# to get your exisiting A records.
+# to see your exisiting A records.
 
 
 # Pull credentials, domain, ID.
 source ddns.config.sh
 
+# Commands for resolving our WAN IP.
 GDNS=$(dig -4 TXT +short o-o.myaddr.l.google.com @ns1.google.com);
 ODNS=$(dig +short myip.opendns.com @resolver1.opendns.com);
 
+# IP matching regex.
 IP='[\b(?:\d{1,3}\.){3}\d{1,3}\b]'
 
-# Another option 
+# Another option
 # IP='[^\d*.\d*.\d*.\d*$]'
 
 # Filter Google quotation marks.
@@ -25,10 +27,10 @@ GDNS=${GDNS//\"};
 ZoneARecord=
 WanIP=
 
-# Pull A record from Zone API
+# Pull A record from Zone API.
 GetARecord () {
 	ZoneARecord=$(curl -s -X GET "https://api.zone.eu/v2/dns/$Domain/a/$ID" -H "accept: application/json" -H "authorization: Basic $AuthCreds" | jq -r '.[0].destination')
-	printf "Zone DNS zone A record: $ZoneARecord"
+	printf "Zone DNS current A record: $ZoneARecord"
 }
 
 # $1 DNS resolved WAN IP.
@@ -37,12 +39,13 @@ GetARecord () {
 
 IpHasChanged () {
 	GetARecord;
-	if ! grep -Fxq $1 <<< $ZoneARecord ; then
+
+	if [ $1 != $ZoneARecord ] ; then
 		printf "\nGoogle or OpenDNS reported different IP from DNS A record.\n"
-		return 1;
-	else
-		return 0;
+		return;
 	fi
+
+	false
 }
 
 # Uses API call to update the DNS A record with information from config and DNS resolvers.
@@ -57,9 +60,8 @@ UpdateARecord () {
 
 # Updates the DNS record if our IP is different from API pulled current record.
 
-DynDNS () {
-	IpHasChanged "$1";
-	if ((IpHasChanged)); then
+UpdateIfIPChanged () {
+	if IpHasChanged $1; then
 		printf "\n\nDetected IP change. DNS update API call executed.\n\n"
 		WanIP=$1;
 		UpdateARecord;
@@ -71,13 +73,13 @@ DynDNS () {
 }
 
 # Check if Google DNS or/and OpenDNS resolved IPs match IP regex.
-# If yes, call DynDNS
+# If yes, call UpdateIfIPChanged
 
 if [[ $GDNS =~ $IP ]]; then
-	DynDNS "$GDNS";
+	UpdateIfIPChanged "$GDNS";
 elif
 	[[ $ODNS =~ $IP ]]; then
-	DynDNS "$ODNS";
+	UpdateIfIPChanged "$ODNS";
 else
 	printf "\n\nDNS resolve did not work as expected - did not match regex.\n"
 	printf "Did nothing.\n\n"
