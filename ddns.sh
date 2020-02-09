@@ -5,7 +5,7 @@
 # Software used: dig, curl, jq.
 #
 # You can use curl -X GET "https://api.zone.eu/v2/dns/example.com/a" -H "accept: application/json" -H "authorization: Basic example.credentials.hash"
-# to see your exisiting A records.
+# to get your exisiting A records.
 
 
 # Pull credentials, domain, ID.
