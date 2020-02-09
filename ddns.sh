@@ -56,6 +56,7 @@ UpdateARecord () {
 		-H "Content-Type: application/json"\
 		-d '{ "destination": "'"$WanIP"'", "name": "'"$Domain"'" }'\
 		-X PUT "https://api.zone.eu/v2/dns/$Domain/a/$ID";
+	printf "\n\n"
 }
 
 # Updates the DNS record if our IP is different from API pulled current record.
