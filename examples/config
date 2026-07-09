@@ -1,0 +1,8 @@
+# Bash config for zone-ddns.
+# Copy to /etc/zone-ddns/config and edit for your domain.
+
+DOMAIN=example.com
+RECORD_NAME=example.com
+NETRC_FILE=/etc/zone-ddns/netrc
+STATE_FILE=/var/lib/zone-ddns/last_ipv4
+API_BASE=https://api.zone.eu/v2

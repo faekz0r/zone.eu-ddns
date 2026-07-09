@@ -1,0 +1,3 @@
+machine api.zone.eu
+  login your-zoneid-username
+  password your-zoneid-api-key

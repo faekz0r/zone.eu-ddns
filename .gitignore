@@ -1,0 +1,14 @@
+# Local credentials and runtime state
+/config
+/netrc
+/last_ipv4
+*.local
+*.netrc
+
+# Debug output from old script versions
+/GetARecord_debug.json
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+*~

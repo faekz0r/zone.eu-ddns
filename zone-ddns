@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_FILE="${ZONE_DDNS_CONFIG:-/etc/zone-ddns/config}"
+
+log() {
+  printf '%s\n' "$*"
+}
+
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+select_python() {
+  if command -v python3 >/dev/null 2>&1 && python3 -c 'import json' >/dev/null 2>&1; then
+    PYTHON_BIN=python3
+    return
+  fi
+  if command -v python >/dev/null 2>&1 && python -c 'import json' >/dev/null 2>&1; then
+    PYTHON_BIN=python
+    return
+  fi
+  die "required command not found: working python3 or python"
+}
+
+load_config() {
+  [[ -r "$CONFIG_FILE" ]] || die "config file is not readable: $CONFIG_FILE"
+  # shellcheck source=/dev/null
+  source "$CONFIG_FILE"
+
+  DOMAIN="${DOMAIN:-}"
+  RECORD_NAME="${RECORD_NAME:-$DOMAIN}"
+  NETRC_FILE="${NETRC_FILE:-/etc/zone-ddns/netrc}"
+  STATE_FILE="${STATE_FILE:-/var/lib/zone-ddns/last_ipv4}"
+  API_BASE="${API_BASE:-https://api.zone.eu/v2}"
+
+  [[ -n "$DOMAIN" ]] || die "DOMAIN is required in $CONFIG_FILE"
+  [[ -n "$RECORD_NAME" ]] || die "RECORD_NAME is required in $CONFIG_FILE"
+  [[ -r "$NETRC_FILE" ]] || die "netrc file is not readable: $NETRC_FILE"
+}
+
+is_ipv4() {
+  local ip="$1"
+  local octet
+  local -a octets
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  IFS=. read -r -a octets <<< "$ip"
+  for octet in "${octets[@]}"; do
+    [[ "$octet" =~ ^[0-9]+$ ]] || return 1
+    (( octet >= 0 && octet <= 255 )) || return 1
+  done
+}
+
+google_wan_ip() {
+  dig -4 TXT +short o-o.myaddr.l.google.com @ns1.google.com 2>/dev/null | tr -d '"' | head -n 1
+}
+
+opendns_wan_ip() {
+  dig +short myip.opendns.com @resolver1.opendns.com 2>/dev/null | head -n 1
+}
+
+detect_wan_ip() {
+  local gdns odns google_valid=0 opendns_valid=0
+  gdns="$(google_wan_ip || true)"
+  odns="$(opendns_wan_ip || true)"
+
+  if is_ipv4 "$gdns"; then
+    google_valid=1
+  fi
+  if is_ipv4 "$odns"; then
+    opendns_valid=1
+  fi
+
+  if (( google_valid && opendns_valid )); then
+    [[ "$gdns" == "$odns" ]] || die "WAN IP resolvers disagree: google=$gdns opendns=$odns"
+    printf '%s\n' "$gdns"
+    return 0
+  fi
+
+  if (( google_valid )); then
+    printf '%s\n' "$gdns"
+    return 0
+  fi
+
+  if (( opendns_valid )); then
+    printf '%s\n' "$odns"
+    return 0
+  fi
+
+  die "could not determine a valid WAN IPv4 address"
+}
+
+api_request() {
+  local method="$1"
+  local url="$2"
+  local payload="${3:-}"
+  local body_file status
+  body_file="$(mktemp)"
+
+  if [[ -n "$payload" ]]; then
+    status="$(curl -sS --netrc-file "$NETRC_FILE" \
+      -H "accept: application/json" \
+      -H "Content-Type: application/json" \
+      -X "$method" \
+      -d "$payload" \
+      -o "$body_file" \
+      -w "%{http_code}" \
+      "$url")"
+  else
+    status="$(curl -sS --netrc-file "$NETRC_FILE" \
+      -H "accept: application/json" \
+      -X "$method" \
+      -o "$body_file" \
+      -w "%{http_code}" \
+      "$url")"
+  fi
+
+  printf '%s\n' "$status"
+  cat "$body_file"
+  rm -f "$body_file"
+}
+
+json_payload() {
+  local name="$1"
+  local destination="$2"
+  "$PYTHON_BIN" - "$name" "$destination" <<'PY'
+import json
+import sys
+
+print(json.dumps({"name": sys.argv[1], "destination": sys.argv[2]}, separators=(",", ":")))
+PY
+}
+
+select_apex_record() {
+  local records_file="$1"
+  "$PYTHON_BIN" - "$records_file" "$RECORD_NAME" <<'PY'
+import json
+import sys
+
+path, record_name = sys.argv[1], sys.argv[2]
+with open(path, encoding="utf-8") as fh:
+    data = json.load(fh)
+
+matches = [record for record in data if record.get("name") == record_name]
+if len(matches) == 0:
+    print("NONE")
+elif len(matches) == 1:
+    record = matches[0]
+    print(f"ONE\t{record.get('id')}\t{record.get('destination')}\t{record.get('modify')}")
+else:
+    print(f"MULTIPLE\t{len(matches)}")
+PY
+}
+
+write_state() {
+  local ip="$1"
+  install -d -m 0755 "$(dirname "$STATE_FILE")"
+  printf '%s\n' "$ip" > "$STATE_FILE"
+}
+
+state_matches() {
+  local ip="$1"
+  local cached_ip
+  [[ -r "$STATE_FILE" ]] || return 1
+  IFS= read -r cached_ip < "$STATE_FILE" || return 1
+  [[ "$cached_ip" == "$ip" ]]
+}
+
+main() {
+  require_command curl
+  require_command dig
+  select_python
+  load_config
+
+  local wan_ip
+  wan_ip="$(detect_wan_ip)"
+  log "Detected WAN IPv4: $wan_ip"
+  if state_matches "$wan_ip"; then
+    log "WAN IPv4 unchanged since last successful update: $wan_ip"
+    exit 0
+  fi
+
+  local response_file status records_file selection kind id current_ip modify payload update_status
+  response_file="$(mktemp)"
+  records_file="$(mktemp)"
+  api_request GET "$API_BASE/dns/$DOMAIN/a" > "$response_file"
+  status="$(head -n 1 "$response_file")"
+  tail -n +2 "$response_file" > "$records_file"
+  rm -f "$response_file"
+
+  [[ "$status" =~ ^2[0-9][0-9]$ ]] || {
+    rm -f "$records_file"
+    die "Zone API returned HTTP $status while listing A records"
+  }
+
+  selection="$(select_apex_record "$records_file")"
+  rm -f "$records_file"
+
+  IFS=$'\t' read -r kind id current_ip modify <<< "$selection"
+  case "$kind" in
+    NONE)
+      payload="$(json_payload "$RECORD_NAME" "$wan_ip")"
+      response_file="$(mktemp)"
+      api_request POST "$API_BASE/dns/$DOMAIN/a" "$payload" > "$response_file"
+      update_status="$(head -n 1 "$response_file")"
+      rm -f "$response_file"
+      [[ "$update_status" =~ ^2[0-9][0-9]$ ]] || die "Zone API returned HTTP $update_status while creating $RECORD_NAME A record"
+      write_state "$wan_ip"
+      log "Created $RECORD_NAME A record pointing to $wan_ip"
+      ;;
+    ONE)
+      [[ "$modify" == "True" || "$modify" == "true" ]] || die "$RECORD_NAME A record id $id is not modifiable"
+      if [[ "$current_ip" == "$wan_ip" ]]; then
+        write_state "$wan_ip"
+        log "$RECORD_NAME A record already points to $wan_ip"
+        exit 0
+      fi
+      payload="$(json_payload "$RECORD_NAME" "$wan_ip")"
+      response_file="$(mktemp)"
+      api_request PUT "$API_BASE/dns/$DOMAIN/a/$id" "$payload" > "$response_file"
+      update_status="$(head -n 1 "$response_file")"
+      rm -f "$response_file"
+      [[ "$update_status" =~ ^2[0-9][0-9]$ ]] || die "Zone API returned HTTP $update_status while updating $RECORD_NAME A record id $id"
+      write_state "$wan_ip"
+      log "Updated $RECORD_NAME A record from $current_ip to $wan_ip"
+      ;;
+    MULTIPLE)
+      die "multiple $RECORD_NAME A records exist; refusing to choose one"
+      ;;
+    *)
+      die "could not parse Zone API A record response"
+      ;;
+  esac
+}
+
+main "$@"
